@@ -3,7 +3,7 @@
 돈이 오가는 시스템에서 **"두 번 나가지 않고, 사라지지 않게"** 를 직접 구현하고 테스트로 증명하는 개인 프로젝트입니다.
 P2P 금융 플랫폼 실무에서 겪은 정합성 문제(중복 이체, 공용 계좌 잔액 덮어쓰기)를 실무 코드 없이 문제만 가져와 새로 만들었습니다.
 
-`Java 17` `Spring Boot` `JPA` `MySQL 8` `Redis 7` `Docker` `JUnit 5`
+`Java 17` `Spring Boot` `JPA` `MySQL 8` `Redis 7` `Docker` `JUnit 5` `AWS EC2` `AWS RDS`
 
 ---
 
@@ -53,6 +53,38 @@ Redis 락은 TTL 때문에 단독으로는 보장이 아니므로, 마지막 판
 - 잔액 부족은 재시도해도 결과가 같으므로 재시도 대상에서 뺐습니다.
 - 같은 행에 충돌이 몰리면 낙관적 락은 100건 처리에 902번 시도(약 9배)가 필요했습니다. 잔액처럼 한 행에 쓰기가 몰리는 곳은 조건부 UPDATE나 비관적 락이 맞고, 낙관적 락은 충돌이 드문 수정에 둡니다.
 
+## 3. 배포 구성 (AWS)
+
+[Client] → EC2(Spring Boot + Redis/Docker) → RDS MySQL 8.4 (퍼블릭 액세스 OFF)
+
+| 구분 | 내용 |
+|---|---|
+| 리전 | ap-southeast-2 (계정 기본 리전) |
+| 컴퓨팅 | EC2 t3.micro, Amazon Linux 2023, Corretto 17, systemd로 jar 실행 (`-Xmx384m`, 스왑 2GB) |
+| DB | RDS MySQL 8.4 db.t4g.micro, 단일 AZ, 퍼블릭 액세스 비활성 |
+| 캐시 | Redis 7 (EC2 내 Docker, `127.0.0.1` 바인딩, `maxmemory-policy noeviction`) |
+| 헬스체크 | `/actuator/health` (DB·Redis 연결 포함, 상세 정보 비노출) |
+
+**네트워크·보안**
+- `psc-ec2-sg`: 22(SSH)·8080 인바운드를 관리자 IP(/32)로만 허용
+- `psc-rds-sg`: 3306 인바운드를 **`psc-ec2-sg` 참조**로만 허용 (IP가 아닌 보안 그룹 체이닝)
+- DB 직접 접근은 EC2를 경유 (배스천 패턴)
+- 비용상 NAT 게이트웨이 없이 기본 VPC 사용. 운영 환경이라면 RDS를 프라이빗 서브넷으로 분리
+
+**설정·비밀 정보**
+- 접속 정보는 환경변수로 주입 (`DB_URL`, `DB_USERNAME`, `DB_PASSWORD`, `REDIS_HOST`, `REDIS_PORT`)
+- EC2의 `/etc/psc/psc.env`(root 소유, 600)를 systemd `EnvironmentFile`로 로드. 저장소에는 [`deploy/psc.env.example`](deploy/psc.env.example)만 포함
+- 서비스 정의: [`deploy/psc.service`](deploy/psc.service)
+- 개선 방향: SSM Parameter Store / Secrets Manager + IAM 역할
+
+**Redis를 `noeviction`으로 둔 이유**
+- Redis는 결제 중복 방지 선점 락으로 쓰입니다. 메모리 부족 시 LRU가 락 키를 지우면 방어선 하나가 조용히 사라지므로, 키를 버리는 대신 쓰기를 실패시킵니다. 실패해도 DB 유니크 제약이 최종 방어선으로 남습니다.
+
+**알려진 한계**
+- 스키마는 `ddl-auto: update` 사용. 운영 환경에서는 Flyway 등 마이그레이션 도구로 관리 필요
+- RDS 기본 collation(`utf8mb4_0900_ai_ci`)과 로컬(`utf8mb4_unicode_ci`)이 다름
+- 수동 배포(scp + systemd). CI/CD 미구성
+
 ## 실무와의 연결
 
 실무(P2P 금융 플랫폼)에서는 이름 없는 `@Async`가 기본 실행기로 떨어져 여러 상품의 상환이 동시에 돌면서 공용 계좌 잔액이 덮어써지는 문제가 있었습니다.
@@ -64,11 +96,13 @@ Redis 락은 TTL 때문에 단독으로는 보장이 아니므로, 마지막 판
 ```bash
 docker compose up -d      # MySQL 8 (3307), Redis 7 (6380)
 ./gradlew test
+./gradlew bootRun         # 헬스체크: curl localhost:8080/actuator/health
 ```
 
 ## 다음 작업
 
-- 진행 중: AWS 배포 (EC2 + RDS)
-- 다음: Outbox + Kafka 이벤트 → Saga 보상 → 정산 배치·대사
+- 완료: AWS 배포 (EC2 + RDS, 보안 그룹 체이닝, systemd 운영)
+- 진행 중: Outbox + Kafka 이벤트
+- 다음: Saga 보상 → 정산 배치·대사
 
 학습노트: [backend-notes](https://github.com/dev-minhoo/backend-notes)
