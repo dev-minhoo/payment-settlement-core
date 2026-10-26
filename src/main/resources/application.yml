@@ -16,6 +16,30 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6380}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+        max.block.ms: 5000
+    consumer:
+      group-id: psc-settlement
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+psc:
+  kafka:
+    topic:
+      payment-events: payment-events
+  outbox:
+    relay:
+      enabled: true          # 테스트에서는 build.gradle에서 false로 덮어쓴다
+      fixed-delay-ms: 1000   # 직전 실행이 끝난 뒤 1초 쉬고 다시 조회
+      send-timeout-ms: 5000  # 브로커 ack 대기 한도
 
 management:
   endpoints:
