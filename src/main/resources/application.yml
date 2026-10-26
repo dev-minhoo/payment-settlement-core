@@ -30,6 +30,14 @@ spring:
       auto-offset-reset: earliest
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+  batch:
+    job:
+      enabled: false              # 기동 시 자동 실행하지 않음. 실행은 JobOperator로 명시적으로
+    jdbc:
+      initialize-schema: always   # BATCH_ 메타 테이블(실행 이력·재시작 정보)을 MySQL에 생성
+  sql:
+    init:
+      mode: always                # schema.sql(대사 결과 테이블) 실행. CREATE TABLE IF NOT EXISTS라 재실행 안전
 
 psc:
   kafka:
@@ -40,6 +48,8 @@ psc:
       enabled: true          # 테스트에서는 build.gradle에서 false로 덮어쓴다
       fixed-delay-ms: 1000   # 직전 실행이 끝난 뒤 1초 쉬고 다시 조회
       send-timeout-ms: 5000  # 브로커 ack 대기 한도
+  reconciliation:
+    chunk-size: 100          # 대사 배치 청크 크기(커밋 단위)
 
 management:
   endpoints:
