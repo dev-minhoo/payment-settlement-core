@@ -3,7 +3,7 @@
 돈이 오가는 시스템에서 **"두 번 나가지 않고, 사라지지 않게"** 를 직접 구현하고 테스트로 증명하는 개인 프로젝트입니다.
 P2P 금융 플랫폼 실무에서 겪은 정합성 문제(중복 이체, 공용 계좌 잔액 덮어쓰기)를 실무 코드 없이 문제만 가져와 새로 만들었습니다.
 
-`Java 17` `Spring Boot` `JPA` `MySQL 8` `Redis 7` `Kafka` `Docker` `JUnit 5` `AWS EC2` `AWS RDS`
+`Java 17` `Kotlin` `Spring Boot` `Spring Batch` `JPA` `MySQL 8` `Redis 7` `Kafka` `Docker` `JUnit 5` `AWS EC2` `AWS RDS`
 
 ---
 
@@ -130,6 +130,46 @@ PaymentEventConsumer → SettlementEventHandler  [@Transactional]
 - 처리 불가능한 메시지(DLQ), SENT 이벤트 정리 배치는 미구현
 - AWS 배포본은 Kafka 도입 전 버전. 다시 배포하려면 브로커와 `KAFKA_BOOTSTRAP_SERVERS` 필요
 
+## 5. 정산 대사 배치: Kotlin + Spring Batch
+
+이벤트를 멱등하게 처리해도, 운영에서는 "정말 맞는지"를 주기적으로 확인하는 대사가 마지막 안전망입니다.
+대상 날짜에 완료된 결제와 정산 원장을 맞춰 보고, 불일치를 유형별로 기록합니다. (`reconciliation` 패키지, Kotlin)
+
+```
+paymentReconciliationJob (JobParameters: targetDate)
+  Step 1 clearPreviousResultStep (tasklet)  같은 날짜의 이전 대사 결과 삭제 → 해소된 불일치가 남지 않게
+  Step 2 reconcileStep (chunk)
+    reader    결제별 정산 건수·합계 집계 (payment LEFT JOIN settlement_entry, 커서)
+    processor 판정 — 일치면 null로 걸러냄
+    writer    reconciliation_mismatch upsert ((target_date, payment_id) 유니크)
+```
+
+| 불일치 유형 | 판정 | 후속 조치 |
+|---|---|---|
+| `MISSING_SETTLEMENT` | 완료 결제인데 정산 0건 | `RETRY_EVENT` — 이벤트 재처리로 메울 수 있음 |
+| `DUPLICATE_SETTLEMENT` | 정산 2건 이상 | `MANUAL_REVIEW` — 이중 정산 가능성, 사람이 판단 |
+| `AMOUNT_MISMATCH` | 정산 합계 ≠ 결제 금액 | `MANUAL_REVIEW` |
+
+| 설계 | 이유 |
+|---|---|
+| 판정 규칙을 `ReconciliationClassifier`(순수 함수)로 분리 | 스프링·DB 없이 규칙만 단위 테스트. 배치 설정과 업무 규칙을 분리 |
+| 금액 비교는 `compareTo` | `BigDecimal`의 `equals`(Kotlin `==`)는 스케일까지 비교 → `10000` ≠ `10000.00` |
+| 결과 테이블 유니크 + upsert | 같은 날짜 재실행·청크 재시작에도 결과 1회. MySQL은 같은 값 upsert 시 영향 행 0 → `assertUpdates(false)` |
+| JDBC Job Repository (`spring-boot-starter-batch-jdbc`) | 실행 이력·리더 위치를 `BATCH_` 테이블에 저장 → 실패 시 마지막 커밋 청크부터 재시작 |
+| Kotlin은 JDBC로 직접 조회 | Kotlin 컴파일러는 Lombok이 만든 Java getter를 보지 못함. 기존 Java 코드와는 테이블로만 연결 |
+| 기동 시 자동 실행 끔 (`spring.batch.job.enabled=false`) | 실행 시점은 스케줄러·운영자가 `targetDate`를 지정해 명시적으로 |
+
+**검증** (`ReconciliationClassifierTest`, `ReconciliationJobTest`, 실제 MySQL)
+- 정상·누락·중복·금액 불일치·스케일만 다른 금액·대상 외(다른 날짜, 미완료) 결제를 섞어 넣으면 불일치 3건만 기록
+- 청크 크기 2로 실행: 읽기 5 · 걸러냄 2 · 쓰기 3, 커밋 3회 이상
+- 같은 날짜 2회 실행 → 결과 3건 유지 (멱등)
+- 누락을 메운 뒤 재실행 → 해소된 건은 결과에서 사라짐
+
+**한계와 다음 단계**
+- 정산 원장에만 있고 결제가 없는 건(고아 정산)은 아직 판정하지 않음
+- `RETRY_EVENT` 자동 재처리(해당 결제의 아웃박스 이벤트 재발행)는 미구현 — 현재는 기록까지
+- 커서 리더는 MySQL에서 결과를 한 번에 받음. 대량이면 페이징 리더 또는 결제 ID 범위 파티셔닝
+
 ## 실무와의 연결
 
 실무(P2P 금융 플랫폼)에서는 이름 없는 `@Async`가 기본 실행기로 떨어져 여러 상품의 상환이 동시에 돌면서 공용 계좌 잔액이 덮어써지는 문제가 있었습니다.
@@ -148,6 +188,8 @@ docker compose up -d      # MySQL 8 (3307), Redis 7 (6380), Kafka (9092)
 
 - 완료: AWS 배포 (EC2 + RDS, 보안 그룹 체이닝, systemd 운영)
 - 완료: Outbox + Kafka 이벤트, 멱등 소비자
-- 다음: Saga 보상 → 정산 배치·대사
+- 완료: 정산 대사 배치 (Kotlin + Spring Batch)
+- 진행 중: GitHub Actions CI
+- 다음: 대사 결과 자동 재처리, Saga 보상
 
 학습노트: [backend-notes](https://github.com/dev-minhoo/backend-notes)
