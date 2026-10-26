@@ -3,7 +3,7 @@
 돈이 오가는 시스템에서 **"두 번 나가지 않고, 사라지지 않게"** 를 직접 구현하고 테스트로 증명하는 개인 프로젝트입니다.
 P2P 금융 플랫폼 실무에서 겪은 정합성 문제(중복 이체, 공용 계좌 잔액 덮어쓰기)를 실무 코드 없이 문제만 가져와 새로 만들었습니다.
 
-`Java 17` `Spring Boot` `JPA` `MySQL 8` `Redis 7` `Docker` `JUnit 5` `AWS EC2` `AWS RDS`
+`Java 17` `Spring Boot` `JPA` `MySQL 8` `Redis 7` `Kafka` `Docker` `JUnit 5` `AWS EC2` `AWS RDS`
 
 ---
 
@@ -85,6 +85,51 @@ Redis 락은 TTL 때문에 단독으로는 보장이 아니므로, 마지막 판
 - RDS 기본 collation(`utf8mb4_0900_ai_ci`)과 로컬(`utf8mb4_unicode_ci`)이 다름
 - 수동 배포(scp + systemd). CI/CD 미구성
 
+## 4. 결제 이벤트 전달: Transactional Outbox + 멱등 소비자
+
+결제가 완료되면 정산 쪽에 알려야 합니다. 그런데 "DB에 결제 저장"과 "Kafka에 이벤트 발행"은 서로 다른 시스템이라 한 트랜잭션으로 묶을 수 없습니다(이중 쓰기 문제).
+- 저장 후 발행 직전에 죽으면 → 결제는 됐는데 정산은 모름 (이벤트 유실)
+- 발행 후 DB 커밋이 실패하면 → 없는 결제를 정산 (유령 이벤트)
+
+**구조**
+
+```
+pay() ──(트랜잭션 없음: 외부 이체 호출)
+  └ PaymentRecorder.recordCompleted()  [@Transactional]
+       ├ payment INSERT (COMPLETED)
+       └ outbox_event INSERT (PENDING)        ← 둘 다 커밋되거나 둘 다 롤백
+
+OutboxRelay (1초 간격 폴링)
+  PENDING 조회 → Kafka 발행(acks=all, ack 대기) → SENT
+  실패 시 PENDING 유지 + attempt_count·last_error 기록 → 다음 실행에서 재시도
+
+PaymentEventConsumer → SettlementEventHandler  [@Transactional]
+  ├ processed_event INSERT (event_id 유니크)  ← 이미 있으면 건너뜀
+  └ settlement_entry INSERT                   ← 둘 다 커밋되거나 둘 다 롤백
+```
+
+| 설계 | 이유 |
+|---|---|
+| `pay()` 전체가 아니라 `PaymentRecorder`에만 트랜잭션 | 외부 이체 호출 동안 DB 커넥션을 잡지 않기 위해. 별도 빈으로 둔 것은 self-invocation 시 `@Transactional`이 적용되지 않기 때문 |
+| `OutboxAppender`는 `Propagation.MANDATORY` | 열린 트랜잭션 없이 이벤트만 단독 커밋되는 실수를 구조적으로 차단 |
+| Kafka key = 결제 ID | 같은 결제의 이벤트는 같은 파티션 → 순서 유지 |
+| 헤더 `eventId` | 전달은 at-least-once(발행 성공 후 SENT 저장 전에 죽으면 재발행). 소비자가 eventId로 중복 제거 |
+| 발행 실패 시 배치 중단 | 브로커 장애면 뒤 이벤트도 실패할 가능성이 크고, 순서를 지키기 위해 |
+
+**검증** (`PaymentOutboxTest`, `PaymentOutboxAtomicityTest`, `OutboxRelayTest`, `PaymentEventConsumerTest`, 실제 Kafka 브로커 사용)
+- 결제 1건 → 이벤트 1건, 같은 키 재요청·동시 50건에도 이벤트 1건
+- 아웃박스 기록이 실패하면 결제도 롤백 (유실 상태가 생기지 않음)
+- 트랜잭션 밖에서 아웃박스 단독 기록 시도 → 거부
+- 발행 실패 → PENDING 유지(attempt 1) → 재실행 시 SENT(attempt 2) → 정산 1건
+- 같은 이벤트를 Kafka로 두 번 발행 → 정산 1건
+- 같은 이벤트를 동시에 20번 소비 → 처리 1건
+
+**한계와 다음 단계**
+- 발행기를 여러 대 띄우면 같은 PENDING을 동시에 집을 수 있음(결과는 소비자 멱등으로 흡수). 다중 인스턴스라면 `FOR UPDATE SKIP LOCKED`나 리더 선출
+- 폴링 대신 CDC(Debezium)로 binlog를 읽는 방식은 지연이 짧고 DB 조회 부하가 없지만 운영 구성 요소가 늘어남
+- 처리 불가능한 메시지(DLQ), SENT 이벤트 정리 배치는 미구현
+- AWS 배포본은 Kafka 도입 전 버전. 다시 배포하려면 브로커와 `KAFKA_BOOTSTRAP_SERVERS` 필요
+
 ## 실무와의 연결
 
 실무(P2P 금융 플랫폼)에서는 이름 없는 `@Async`가 기본 실행기로 떨어져 여러 상품의 상환이 동시에 돌면서 공용 계좌 잔액이 덮어써지는 문제가 있었습니다.
@@ -94,7 +139,7 @@ Redis 락은 TTL 때문에 단독으로는 보장이 아니므로, 마지막 판
 ## 실행
 
 ```bash
-docker compose up -d      # MySQL 8 (3307), Redis 7 (6380)
+docker compose up -d      # MySQL 8 (3307), Redis 7 (6380), Kafka (9092)
 ./gradlew test
 ./gradlew bootRun         # 헬스체크: curl localhost:8080/actuator/health
 ```
@@ -102,7 +147,7 @@ docker compose up -d      # MySQL 8 (3307), Redis 7 (6380)
 ## 다음 작업
 
 - 완료: AWS 배포 (EC2 + RDS, 보안 그룹 체이닝, systemd 운영)
-- 진행 중: Outbox + Kafka 이벤트
+- 완료: Outbox + Kafka 이벤트, 멱등 소비자
 - 다음: Saga 보상 → 정산 배치·대사
 
 학습노트: [backend-notes](https://github.com/dev-minhoo/backend-notes)
