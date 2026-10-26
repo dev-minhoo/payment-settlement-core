@@ -1,0 +1,101 @@
+# main push · PR마다 빌드와 전체 테스트를 돌린다.
+# 테스트는 실제 MySQL·Redis·Kafka가 필요해서(통합 테스트) GitHub Actions 서비스 컨테이너로 띄운다.
+# 로컬 docker-compose와 같은 이미지를 쓰고, 포트만 기본값이라 환경변수로 접속 정보를 바꿔 준다.
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: psc
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+      kafka:
+        image: apache/kafka:4.0.0
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+          KAFKA_NUM_PARTITIONS: 3
+        options: >-
+          --health-cmd="/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval=10s
+          --health-timeout=10s
+          --health-retries=15
+
+    env:
+      DB_URL: jdbc:mysql://localhost:3306/psc?serverTimezone=Asia/Seoul&characterEncoding=UTF-8
+      DB_USERNAME: root
+      DB_PASSWORD: root            # CI 전용 일회용 컨테이너 비밀번호. 실제 비밀 값은 GitHub Secrets로만
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v5   # Gradle 의존성·빌드 캐시
+
+      - name: gradlew 실행 권한 (Windows에서 커밋돼 실행 비트가 없음)
+        run: chmod +x gradlew
+
+      - name: 빌드 + 전체 테스트
+        run: ./gradlew build --no-daemon
+
+      - name: 테스트 리포트 업로드 (실패 시)
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-report
+          path: build/reports/tests/test
+          retention-days: 7
