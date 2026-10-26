@@ -45,7 +45,8 @@ public class PaymentRecorder {
     }
 
     private static String completedPayload(Payment p) {
-        return "{\"paymentId\":%d,\"idempotencyKey\":\"%s\",\"amount\":\"%s\"}".formatted(
+        // amount는 JSON 숫자로 둔다(문자열이면 소비자 쪽 BigDecimal 변환이 매퍼 설정에 의존하게 된다)
+        return "{\"paymentId\":%d,\"idempotencyKey\":\"%s\",\"amount\":%s}".formatted(
                 p.getId(),
                 escapeJson(p.getIdempotencyKey()),
                 p.getAmount().toPlainString()
