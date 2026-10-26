@@ -1,9 +1,11 @@
 # payment-settlement-core
 
+[![CI](https://github.com/dev-minhoo/payment-settlement-core/actions/workflows/ci.yml/badge.svg)](https://github.com/dev-minhoo/payment-settlement-core/actions/workflows/ci.yml)
+
 돈이 오가는 시스템에서 **"두 번 나가지 않고, 사라지지 않게"** 를 직접 구현하고 테스트로 증명하는 개인 프로젝트입니다.
 P2P 금융 플랫폼 실무에서 겪은 정합성 문제(중복 이체, 공용 계좌 잔액 덮어쓰기)를 실무 코드 없이 문제만 가져와 새로 만들었습니다.
 
-`Java 17` `Kotlin` `Spring Boot` `Spring Batch` `JPA` `MySQL 8` `Redis 7` `Kafka` `Docker` `JUnit 5` `AWS EC2` `AWS RDS`
+`Java 17` `Kotlin` `Spring Boot` `Spring Batch` `JPA` `MySQL 8` `Redis 7` `Kafka` `Docker` `JUnit 5` `AWS EC2` `AWS RDS` `GitHub Actions`
 
 ---
 
@@ -170,6 +172,21 @@ paymentReconciliationJob (JobParameters: targetDate)
 - `RETRY_EVENT` 자동 재처리(해당 결제의 아웃박스 이벤트 재발행)는 미구현 — 현재는 기록까지
 - 커서 리더는 MySQL에서 결과를 한 번에 받음. 대량이면 페이징 리더 또는 결제 ID 범위 파티셔닝
 
+## 6. CI: GitHub Actions
+
+`main` push와 PR마다 빌드와 전체 테스트를 실행합니다. ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
+
+| 설계 | 이유 |
+|---|---|
+| MySQL·Redis·Kafka를 서비스 컨테이너로 | 테스트가 실제 DB 제약·Redis 원자 연산·Kafka 전달을 검증하는 통합 테스트라 목(mock)으로 대체하지 않음. 로컬 docker-compose와 같은 이미지 |
+| 접속 정보는 환경변수로 덮어쓰기 | 앱 설정(`DB_URL`, `REDIS_PORT`, `KAFKA_BOOTSTRAP_SERVERS`)을 배포와 같은 방식으로 주입. CI용 코드 분기 없음 |
+| 서비스 헬스체크 후 테스트 시작 | 브로커·DB가 준비되기 전에 테스트가 붙어 생기는 간헐 실패 방지 |
+| 실패 시 테스트 리포트 업로드 | 어떤 테스트가 왜 실패했는지 Actions 화면에서 바로 확인 |
+| 같은 브랜치 이전 실행 취소 (`concurrency`) | 연속 push 시 마지막 커밋만 검증 |
+
+- CI의 DB 비밀번호는 일회용 컨테이너 값. 실제 비밀 값(운영 DB 등)은 저장소에 두지 않고 GitHub Secrets로만 다룸
+- 배포 자동화(main 머지 → EC2 반영)는 미구성. EC2·RDS를 상시 켜 두지 않는 데모 환경이라 수동 배포 유지
+
 ## 실무와의 연결
 
 실무(P2P 금융 플랫폼)에서는 이름 없는 `@Async`가 기본 실행기로 떨어져 여러 상품의 상환이 동시에 돌면서 공용 계좌 잔액이 덮어써지는 문제가 있었습니다.
@@ -189,7 +206,7 @@ docker compose up -d      # MySQL 8 (3307), Redis 7 (6380), Kafka (9092)
 - 완료: AWS 배포 (EC2 + RDS, 보안 그룹 체이닝, systemd 운영)
 - 완료: Outbox + Kafka 이벤트, 멱등 소비자
 - 완료: 정산 대사 배치 (Kotlin + Spring Batch)
-- 진행 중: GitHub Actions CI
+- 완료: GitHub Actions CI (실제 MySQL·Redis·Kafka 서비스 컨테이너로 전체 테스트)
 - 다음: 대사 결과 자동 재처리, Saga 보상
 
 학습노트: [backend-notes](https://github.com/dev-minhoo/backend-notes)
