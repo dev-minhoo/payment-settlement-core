@@ -39,4 +39,12 @@ public class Payment {
         this.status = PaymentStatus.REQUESTED;
         this.createdAt = LocalDateTime.now();
     }
+
+    /** 외부 이체가 성공한 결제를 완료 상태로 바꾼다. */
+    public void complete() {
+        if (this.status != PaymentStatus.REQUESTED) {
+            throw new IllegalStateException("REQUESTED 상태에서만 완료할 수 있습니다. 현재=" + this.status);
+        }
+        this.status = PaymentStatus.COMPLETED;
+    }
 }
